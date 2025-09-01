@@ -1,0 +1,11 @@
+# Entorno virtual
+venv/
+__pycache__/
+
+# Archivos sensibles
+.env
+*.db
+
+# Datos
+data/raw/
+data/db/*.db
