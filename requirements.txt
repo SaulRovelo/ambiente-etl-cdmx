@@ -3,3 +3,5 @@ requests
 sqlalchemy
 prefect
 python-dotenv
+pyarrow
+matplotlib
