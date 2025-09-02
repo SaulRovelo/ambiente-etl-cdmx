@@ -5,3 +5,4 @@ prefect
 python-dotenv
 pyarrow
 matplotlib
+prefect

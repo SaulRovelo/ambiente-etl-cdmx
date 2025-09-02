@@ -1,2 +1,2 @@
 ciudad,pais,fecha_hora,aqi_us,aqi_cn,contaminante_principal,temperatura_c,humedad_pct,viento_mps
-Mexico City,Mexico,2025-09-01 21:00:00+00:00,29,22,o3,22,53,1.68
+CDMX,Mexico,2025-09-02 19:00:00+00:00,75,32,p2,22,53,2.51
