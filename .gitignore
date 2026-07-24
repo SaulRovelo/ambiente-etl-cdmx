@@ -1,0 +1,36 @@
+# Entornos y configuración local
+.env
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Cobertura y distribución
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Datos generados
+data/raw/*
+!data/raw/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+data/db/*
+!data/db/.gitkeep
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Editores y sistema operativo
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
