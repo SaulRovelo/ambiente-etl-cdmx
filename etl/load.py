@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import os
 import re
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 import pandas as pd
 from sqlalchemy import (
@@ -24,12 +26,18 @@ from sqlalchemy.engine import Connection
 from sqlalchemy.exc import SQLAlchemyError
 
 from etl.config import build_project_paths
-from etl.transform import QualityResult, SCHEMA_COLUMNS
+from etl.transform import (
+    REJECTED_COLUMNS,
+    QualityResult,
+    SCHEMA_COLUMNS,
+)
 
 
 TABLE_NAME = "calidad_aire"
 _SHA256_HEX = re.compile(r"^[0-9a-fA-F]{64}$")
 _TransactionStatus = Literal["committed", "rolled_back", "no_changes"]
+_ExportStatus = Literal["exported", "failed"]
+_ExportTarget = Literal["csv", "parquet", "rejected_csv"]
 
 METADATA = MetaData()
 AIR_QUALITY_TABLE = Table(
@@ -113,6 +121,51 @@ class LoadTransactionError(LoadError):
         )
 
 
+class ExportError(LoadError):
+    """Error base de las exportaciones de archivos procesados."""
+
+
+class ExportSchemaError(ExportError):
+    """Los registros rechazados no cumplen el esquema esperado."""
+
+    def __init__(self, missing_columns: tuple[str, ...]) -> None:
+        self.missing_columns = missing_columns
+        columns = ", ".join(missing_columns)
+        super().__init__(
+            f"Los registros rechazados no contienen las columnas: {columns}"
+        )
+
+
+class ExportReadError(ExportError):
+    """No fue posible leer el historial consolidado desde SQLite."""
+
+
+@dataclass(frozen=True, slots=True)
+class ExportIssue:
+    """Descripción no sensible de una exportación fallida."""
+
+    target: _ExportTarget
+    error_type: str
+    message: str
+
+
+@dataclass(frozen=True, slots=True)
+class ExportResult:
+    """Resultado tipado de exportar archivos válidos y rechazados."""
+
+    csv_path: Path
+    parquet_path: Path
+    rejected_csv_path: Path
+    csv_rows_exported: int
+    parquet_rows_exported: int
+    valid_rows_exported: int
+    rejected_rows_exported: int
+    csv_status: _ExportStatus
+    parquet_status: _ExportStatus
+    rejected_csv_status: _ExportStatus
+    errors: tuple[ExportIssue, ...]
+
+
 def load_air_quality(
     source: QualityResult | pd.DataFrame,
     *,
@@ -186,6 +239,93 @@ def load_air_quality(
         engine.dispose()
 
 
+def export_air_quality(
+    quality_result: QualityResult,
+    *,
+    database_path: Path | None = None,
+    output_directory: Path | None = None,
+) -> ExportResult:
+    """Exporta el historial SQLite y los rechazos de la ejecución actual."""
+
+    if not isinstance(quality_result, QualityResult):
+        raise ExportError("La exportación requiere un QualityResult")
+
+    project_paths = build_project_paths()
+    resolved_database_path = (
+        database_path or project_paths.database_path
+    ).expanduser().resolve()
+    resolved_output_directory = (
+        output_directory or project_paths.processed_dir
+    ).expanduser().resolve()
+    csv_path = resolved_output_directory / (
+        project_paths.processed_csv_path.name
+    )
+    parquet_path = resolved_output_directory / (
+        project_paths.processed_parquet_path.name
+    )
+    rejected_csv_path = resolved_output_directory / (
+        project_paths.rejected_csv_path.name
+    )
+
+    history = _read_consolidated_records(resolved_database_path)
+    rejected = _copy_rejected_records(quality_result.rejected_records)
+    export_jobs: tuple[
+        tuple[
+            _ExportTarget,
+            pd.DataFrame,
+            Path,
+            Callable[[pd.DataFrame, Path], None],
+        ],
+        ...,
+    ] = (
+        ("csv", history, csv_path, _write_csv_file),
+        ("parquet", history, parquet_path, _write_parquet_file),
+        (
+            "rejected_csv",
+            rejected,
+            rejected_csv_path,
+            _write_rejected_csv_file,
+        ),
+    )
+
+    statuses: dict[_ExportTarget, _ExportStatus] = {}
+    rows_exported: dict[_ExportTarget, int] = {}
+    issues: list[ExportIssue] = []
+    for target, dataframe, destination, writer in export_jobs:
+        try:
+            _atomic_write(dataframe, destination, writer)
+        except Exception as exc:
+            statuses[target] = "failed"
+            rows_exported[target] = 0
+            issues.append(
+                ExportIssue(
+                    target=target,
+                    error_type=type(exc).__name__,
+                    message=f"No fue posible completar la exportación {target}",
+                )
+            )
+        else:
+            statuses[target] = "exported"
+            rows_exported[target] = len(dataframe)
+
+    return ExportResult(
+        csv_path=csv_path,
+        parquet_path=parquet_path,
+        rejected_csv_path=rejected_csv_path,
+        csv_rows_exported=rows_exported["csv"],
+        parquet_rows_exported=rows_exported["parquet"],
+        valid_rows_exported=min(
+            rows_exported["csv"],
+            rows_exported["parquet"],
+        ),
+        rejected_rows_exported=rows_exported["rejected_csv"],
+        csv_status=statuses["csv"],
+        parquet_status=statuses["parquet"],
+        rejected_csv_status=statuses["rejected_csv"],
+        errors=tuple(issues),
+    )
+
+
 def _resolve_valid_records(
     source: QualityResult | pd.DataFrame,
 ) -> pd.DataFrame:
@@ -196,6 +336,100 @@ def _resolve_valid_records(
     if isinstance(source, pd.DataFrame):
         return source
     raise LoadError("La carga requiere QualityResult o un DataFrame")
+
+
+def _read_consolidated_records(database_path: Path) -> pd.DataFrame:
+    """Lee todo el historial con orden reproducible y sin escribir en SQLite."""
+
+    if not database_path.is_file():
+        raise ExportReadError(
+            "No existe una base SQLite disponible para exportar"
+        )
+    engine = create_engine(
+        URL.create("sqlite", database=str(database_path)),
+        future=True,
+    )
+    statement = select(AIR_QUALITY_TABLE).order_by(
+        AIR_QUALITY_TABLE.c.timestamp_api,
+        AIR_QUALITY_TABLE.c.record_id,
+    )
+    try:
+        with engine.connect() as connection:
+            rows = connection.execute(statement).mappings().all()
+    except SQLAlchemyError:
+        raise ExportReadError(
+            "No fue posible leer la tabla consolidada de calidad del aire"
+        ) from None
+    finally:
+        engine.dispose()
+    return pd.DataFrame(
+        (dict(row) for row in rows),
+        columns=SCHEMA_COLUMNS,
+    )
+
+
+def _copy_rejected_records(dataframe: pd.DataFrame) -> pd.DataFrame:
+    """Copia los rechazos actuales con columnas completas y orden estable."""
+
+    missing_columns = tuple(
+        column
+        for column in REJECTED_COLUMNS
+        if column not in dataframe.columns
+    )
+    if missing_columns:
+        raise ExportSchemaError(missing_columns)
+    return dataframe.loc[:, REJECTED_COLUMNS].copy(deep=True)
+
+
+def _atomic_write(
+    dataframe: pd.DataFrame,
+    destination: Path,
+    writer: Callable[[pd.DataFrame, Path], None],
+) -> None:
+    """Escribe en el mismo directorio y reemplaza el destino al completar."""
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    file_descriptor, temporary_name = tempfile.mkstemp(
+        dir=destination.parent,
+        prefix=f".{destination.name}.",
+        suffix=".tmp",
+    )
+    os.close(file_descriptor)
+    temporary_path = Path(temporary_name)
+    try:
+        writer(dataframe, temporary_path)
+        temporary_path.replace(destination)
+    except Exception:
+        temporary_path.unlink(missing_ok=True)
+        raise
+
+
+def _write_csv_file(dataframe: pd.DataFrame, destination: Path) -> None:
+    """Escribe un CSV UTF-8 sin índice."""
+
+    dataframe.to_csv(destination, index=False, encoding="utf-8")
+
+
+def _write_parquet_file(
+    dataframe: pd.DataFrame,
+    destination: Path,
+) -> None:
+    """Escribe Parquet mediante PyArrow sin índice."""
+
+    dataframe.to_parquet(
+        destination,
+        index=False,
+        engine="pyarrow",
+    )
+
+
+def _write_rejected_csv_file(
+    dataframe: pd.DataFrame,
+    destination: Path,
+) -> None:
+    """Escribe el CSV de rechazos de la ejecución actual."""
+
+    dataframe.to_csv(destination, index=False, encoding="utf-8")
 
 
 def _prepare_records(dataframe: pd.DataFrame) -> list[dict[str, Any]]:
