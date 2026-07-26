@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from dataclasses import fields
 from datetime import UTC, datetime, timedelta, timezone
+from inspect import signature
 from pathlib import Path
 from typing import Any
 
@@ -140,6 +142,39 @@ def make_quality_result(
         total_received=len(valid) + len(rejected),
         total_valid=len(valid),
         total_rejected=len(rejected),
+    )
+
+
+def test_public_load_and_export_contracts_are_stable() -> None:
+    assert tuple(signature(load_air_quality).parameters) == (
+        "source",
+        "database_path",
+    )
+    assert tuple(signature(export_air_quality).parameters) == (
+        "quality_result",
+        "database_path",
+        "output_directory",
+    )
+    assert tuple(field.name for field in fields(LoadResult)) == (
+        "database_path",
+        "table_name",
+        "rows_received",
+        "rows_inserted",
+        "rows_duplicated",
+        "transaction_status",
+    )
+    assert tuple(field.name for field in fields(ExportResult)) == (
+        "csv_path",
+        "parquet_path",
+        "rejected_csv_path",
+        "csv_rows_exported",
+        "parquet_rows_exported",
+        "valid_rows_exported",
+        "rejected_rows_exported",
+        "csv_status",
+        "parquet_status",
+        "rejected_csv_status",
+        "errors",
     )
 
 

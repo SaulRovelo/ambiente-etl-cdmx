@@ -5,9 +5,11 @@ from __future__ import annotations
 import io
 import json
 import logging
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from copy import deepcopy
+from dataclasses import fields
 from datetime import UTC, datetime
+from inspect import signature
 from pathlib import Path
 from typing import Any
 
@@ -30,7 +32,6 @@ from etl.extract import (
 from etl.utils import REDACTED, configure_safe_logger
 
 
-FIXTURE_PATH = Path(__file__).parent / "fixtures" / "iqair_success.json"
 FIXED_TIMESTAMP = datetime(2026, 7, 24, 18, 30, 15, 123456, tzinfo=UTC)
 FAKE_API_KEY = "fake-iqair-key-for-tests"
 
@@ -91,13 +92,6 @@ class RecordingGet:
 
 
 @pytest.fixture
-def sample_payload() -> dict[str, Any]:
-    """Carga el fixture público, pequeño y sin secretos."""
-
-    return json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
-
-
-@pytest.fixture
 def settings(tmp_path: Path) -> Settings:
     """Crea configuración aislada con credenciales ficticias."""
 
@@ -132,6 +126,24 @@ def run_extract(
         timestamp_factory=lambda: FIXED_TIMESTAMP,
         token_factory=lambda: token,
         logger=logger,
+    )
+
+
+def test_public_extraction_contract_is_stable() -> None:
+    assert tuple(signature(extract_air_quality).parameters) == (
+        "settings",
+        "http_get",
+        "timestamp_factory",
+        "token_factory",
+        "logger",
+    )
+    assert tuple(field.name for field in fields(ExtractionResult)) == (
+        "payload",
+        "raw_path",
+        "extracted_at",
+        "endpoint",
+        "status_code",
+        "metadata",
     )
 
 
@@ -359,10 +371,13 @@ def test_write_failure_removes_partial_file(
 def test_api_key_is_absent_from_logs_exceptions_results_and_files(
     settings: Settings,
     sample_payload: dict[str, Any],
+    isolated_logger: Callable[[str], logging.Logger],
 ) -> None:
     stream = io.StringIO()
+    logger_name = "etl.tests.extract.security"
+    isolated_logger(logger_name)
     logger = configure_safe_logger(
-        "etl.tests.extract.security",
+        logger_name,
         api_key=FAKE_API_KEY,
         stream=stream,
     )

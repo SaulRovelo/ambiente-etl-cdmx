@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 from copy import deepcopy
+from dataclasses import fields
 from datetime import UTC, datetime
+from inspect import signature
 from pathlib import Path
 from typing import Any
 
@@ -27,15 +29,7 @@ from etl.transform import (
 from etl.utils import generate_record_id
 
 
-FIXTURE_PATH = Path(__file__).parent / "fixtures" / "iqair_success.json"
 EXTRACTED_AT = datetime(2026, 7, 24, 18, 30, 15, tzinfo=UTC)
-
-
-@pytest.fixture
-def sample_payload() -> dict[str, Any]:
-    """Carga una respuesta representativa sin credenciales."""
-
-    return json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
 
 
 @pytest.fixture
@@ -99,6 +93,28 @@ def dataframe_with_value(
     changed[column] = changed[column].astype("object")
     changed.at[changed.index[0], column] = value
     return changed
+
+
+def test_public_transformation_contracts_are_stable() -> None:
+    assert tuple(signature(transform_air_quality).parameters) == (
+        "source",
+        "extracted_at",
+    )
+    assert tuple(signature(validate_air_quality).parameters) == ("source",)
+    assert tuple(field.name for field in fields(TransformResult)) == (
+        "dataframe",
+        "warnings",
+        "records_transformed",
+        "schema",
+    )
+    assert tuple(field.name for field in fields(QualityResult)) == (
+        "valid_records",
+        "rejected_records",
+        "warnings",
+        "total_received",
+        "total_valid",
+        "total_rejected",
+    )
 
 
 def test_fixture_transforms_to_one_typed_record(

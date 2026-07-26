@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import io
 import logging
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -181,11 +182,15 @@ def test_redact_sensitive_text_hides_known_and_query_secrets() -> None:
     assert redacted.count(REDACTED) == 2
 
 
-def test_safe_logger_redacts_api_key_from_messages_and_exceptions() -> None:
+def test_safe_logger_redacts_api_key_from_messages_and_exceptions(
+    isolated_logger: Callable[[str], logging.Logger],
+) -> None:
     secret = "fake-secret-for-logger-tests"
     stream = io.StringIO()
+    logger_name = "etl.tests.safe"
+    isolated_logger(logger_name)
     logger = configure_safe_logger(
-        "etl.tests.safe",
+        logger_name,
         api_key=secret,
         level=logging.INFO,
         stream=stream,
