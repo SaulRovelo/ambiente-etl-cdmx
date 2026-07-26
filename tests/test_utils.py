@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 import logging
 from datetime import UTC, datetime, timedelta, timezone
@@ -15,6 +16,7 @@ from etl.utils import (
     configure_safe_logger,
     ensure_data_directories,
     format_utc_timestamp,
+    generate_record_id,
     redact_sensitive_text,
     utc_now,
 )
@@ -44,6 +46,104 @@ def test_format_utc_timestamp_normalizes_offset_to_z() -> None:
 def test_format_utc_timestamp_rejects_naive_datetime() -> None:
     with pytest.raises(ValueError, match="zona horaria"):
         format_utc_timestamp(datetime(2026, 7, 24, 8, 30, 15))
+
+
+def test_generate_record_id_matches_canonical_sha256() -> None:
+    timestamp = datetime(2026, 7, 25, 1, 2, 3, 456000, tzinfo=UTC)
+    canonical_value = (
+        "ciudad ejemplo|estado ejemplo|país ejemplo|"
+        "2026-07-25T01:02:03.456000Z"
+    )
+
+    record_id = generate_record_id(
+        "Ciudad Ejemplo",
+        "Estado Ejemplo",
+        "País Ejemplo",
+        timestamp,
+    )
+
+    assert record_id == hashlib.sha256(
+        canonical_value.encode("utf-8")
+    ).hexdigest()
+    assert len(record_id) == 64
+
+
+def test_generate_record_id_normalizes_case_spaces_and_timezone() -> None:
+    canonical = generate_record_id(
+        "ciudad ejemplo",
+        "estado ejemplo",
+        "méxico",
+        datetime(2026, 7, 25, 7, 0, tzinfo=UTC),
+    )
+    equivalent = generate_record_id(
+        "  CIUDAD   EJEMPLO  ",
+        " Estado\tEjemplo ",
+        "MÉXICO",
+        datetime(
+            2026,
+            7,
+            25,
+            1,
+            0,
+            tzinfo=timezone(timedelta(hours=-6)),
+        ),
+    )
+
+    assert equivalent == canonical
+
+
+@pytest.mark.parametrize(
+    ("field_name", "replacement"),
+    [
+        ("city", "Otra Ciudad"),
+        ("state", "Otro Estado"),
+        ("country", "Otro País"),
+        (
+            "timestamp_api",
+            datetime(2026, 7, 25, 7, 0, 1, tzinfo=UTC),
+        ),
+    ],
+)
+def test_generate_record_id_changes_with_identity_components(
+    field_name: str,
+    replacement: str | datetime,
+) -> None:
+    components: dict[str, str | datetime] = {
+        "city": "Ciudad Ejemplo",
+        "state": "Estado Ejemplo",
+        "country": "País Ejemplo",
+        "timestamp_api": datetime(2026, 7, 25, 7, 0, tzinfo=UTC),
+    }
+    original = generate_record_id(
+        components["city"],
+        components["state"],
+        components["country"],
+        components["timestamp_api"],
+    )
+    components[field_name] = replacement
+
+    changed = generate_record_id(
+        components["city"],
+        components["state"],
+        components["country"],
+        components["timestamp_api"],
+    )
+
+    assert changed != original
+
+
+def test_generate_record_id_rejects_invalid_identity_components() -> None:
+    timestamp = datetime(2026, 7, 25, 7, 0, tzinfo=UTC)
+
+    with pytest.raises(ValueError, match="city"):
+        generate_record_id("  ", "Estado", "País", timestamp)
+    with pytest.raises(ValueError, match="zona horaria"):
+        generate_record_id(
+            "Ciudad",
+            "Estado",
+            "País",
+            datetime(2026, 7, 25, 7, 0),
+        )
 
 
 def test_ensure_data_directories_is_controlled_and_idempotent(

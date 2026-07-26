@@ -13,13 +13,18 @@ import pytest
 
 from etl.extract import ExtractionMetadata, ExtractionResult
 from etl.transform import (
+    REJECTED_COLUMNS,
     SCHEMA_COLUMNS,
     InvalidTransformTimestampError,
+    MissingQualityColumnsError,
     MissingTransformStructureError,
+    QualityResult,
     TransformationError,
     TransformResult,
     transform_air_quality,
+    validate_air_quality,
 )
+from etl.utils import generate_record_id
 
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "iqair_success.json"
@@ -31,6 +36,17 @@ def sample_payload() -> dict[str, Any]:
     """Carga una respuesta representativa sin credenciales."""
 
     return json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
+
+
+@pytest.fixture
+def normalized_dataframe(
+    sample_payload: dict[str, Any],
+) -> pd.DataFrame:
+    """Genera el DataFrame válido de la Etapa 4."""
+
+    return transform_air_quality(
+        make_extraction_result(sample_payload)
+    ).dataframe
 
 
 def make_extraction_result(
@@ -70,6 +86,19 @@ def make_extraction_result(
             weather_fields=tuple(sorted(weather)),
         ),
     )
+
+
+def dataframe_with_value(
+    dataframe: pd.DataFrame,
+    column: str,
+    value: Any,
+) -> pd.DataFrame:
+    """Copia un DataFrame y permite inyectar un escalar incluso si es inválido."""
+
+    changed = dataframe.copy(deep=True)
+    changed[column] = changed[column].astype("object")
+    changed.at[changed.index[0], column] = value
+    return changed
 
 
 def test_fixture_transforms_to_one_typed_record(
@@ -325,3 +354,409 @@ def test_payload_equivalent_requires_extraction_timestamp(
 ) -> None:
     with pytest.raises(TransformationError, match="extracted_at"):
         transform_air_quality(sample_payload)
+
+
+def test_quality_accepts_valid_record_and_generates_record_id(
+    sample_payload: dict[str, Any],
+) -> None:
+    transformed = transform_air_quality(
+        make_extraction_result(sample_payload)
+    )
+
+    result = validate_air_quality(transformed)
+
+    assert isinstance(result, QualityResult)
+    assert result.total_received == 1
+    assert result.total_valid == 1
+    assert result.total_rejected == 0
+    assert result.rejected_records.empty
+    row = result.valid_records.iloc[0]
+    assert row["record_id"] == generate_record_id(
+        row["city"],
+        row["state"],
+        row["country"],
+        row["timestamp_api"].to_pydatetime(),
+    )
+
+
+@pytest.mark.parametrize(
+    ("column", "invalid_value"),
+    [
+        ("city", ""),
+        ("state", "   "),
+        ("country", pd.NA),
+    ],
+)
+def test_quality_rejects_missing_required_location_text(
+    column: str,
+    invalid_value: Any,
+    normalized_dataframe: pd.DataFrame,
+) -> None:
+    dataframe = dataframe_with_value(
+        normalized_dataframe,
+        column,
+        invalid_value,
+    )
+
+    result = validate_air_quality(dataframe)
+
+    assert result.total_rejected == 1
+    assert f"{column}: debe contener texto" in (
+        result.rejected_records.loc[0, "rejection_reason"]
+    )
+    assert pd.isna(result.rejected_records.loc[0, "record_id"])
+
+
+@pytest.mark.parametrize(
+    ("column", "invalid_value"),
+    [
+        ("timestamp_api", "no-es-una-fecha"),
+        ("timestamp_api", datetime(2026, 7, 25, 1, 0)),
+        ("timestamp_extraction", "no-es-una-fecha"),
+        ("timestamp_extraction", datetime(2026, 7, 25, 1, 0)),
+    ],
+)
+def test_quality_rejects_invalid_required_timestamp(
+    column: str,
+    invalid_value: Any,
+    normalized_dataframe: pd.DataFrame,
+) -> None:
+    dataframe = dataframe_with_value(
+        normalized_dataframe,
+        column,
+        invalid_value,
+    )
+
+    result = validate_air_quality(dataframe)
+
+    assert result.total_rejected == 1
+    assert f"{column}: debe ser una fecha válida" in (
+        result.rejected_records.loc[0, "rejection_reason"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("invalid_value", "expected_reason"),
+    [
+        (pd.NA, "debe existir y ser un entero válido"),
+        ("no-numérico", "debe existir y ser un entero válido"),
+        (42.5, "debe existir y ser un entero válido"),
+        (-1, "debe ser mayor o igual que 0"),
+    ],
+)
+def test_quality_rejects_invalid_aqius(
+    invalid_value: Any,
+    expected_reason: str,
+    normalized_dataframe: pd.DataFrame,
+) -> None:
+    dataframe = dataframe_with_value(
+        normalized_dataframe,
+        "aqius",
+        invalid_value,
+    )
+
+    result = validate_air_quality(dataframe)
+
+    assert result.total_rejected == 1
+    assert expected_reason in (
+        result.rejected_records.loc[0, "rejection_reason"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("column", "invalid_value", "expected_reason"),
+    [
+        ("latitude", -90.1, "latitude: debe ser >= -90"),
+        ("latitude", 90.1, "latitude: debe ser <= 90"),
+        ("longitude", -180.1, "longitude: debe ser >= -180"),
+        ("longitude", 180.1, "longitude: debe ser <= 180"),
+        ("humidity_pct", -0.1, "humidity_pct: debe ser >= 0"),
+        ("humidity_pct", 100.1, "humidity_pct: debe ser <= 100"),
+        ("pressure_hpa", 0, "pressure_hpa: debe ser > 0"),
+        ("wind_speed_ms", -0.1, "wind_speed_ms: debe ser >= 0"),
+        (
+            "wind_direction_deg",
+            -0.1,
+            "wind_direction_deg: debe ser >= 0",
+        ),
+        (
+            "wind_direction_deg",
+            360,
+            "wind_direction_deg: debe ser < 360",
+        ),
+    ],
+)
+def test_quality_rejects_values_outside_confirmed_ranges(
+    column: str,
+    invalid_value: float,
+    expected_reason: str,
+    normalized_dataframe: pd.DataFrame,
+) -> None:
+    dataframe = dataframe_with_value(
+        normalized_dataframe,
+        column,
+        invalid_value,
+    )
+
+    result = validate_air_quality(dataframe)
+
+    assert result.total_rejected == 1
+    assert expected_reason in (
+        result.rejected_records.loc[0, "rejection_reason"]
+    )
+
+
+def test_quality_accepts_confirmed_range_boundaries(
+    normalized_dataframe: pd.DataFrame,
+) -> None:
+    rows = []
+    boundary_values = (
+        ("latitude", -90),
+        ("latitude", 90),
+        ("longitude", -180),
+        ("longitude", 180),
+        ("humidity_pct", 0),
+        ("humidity_pct", 100),
+        ("pressure_hpa", 0.1),
+        ("wind_speed_ms", 0),
+        ("wind_direction_deg", 0),
+        ("wind_direction_deg", 359.999),
+    )
+    for column, value in boundary_values:
+        row = dataframe_with_value(normalized_dataframe, column, value)
+        row["timestamp_api"] = row["timestamp_api"] + pd.Timedelta(
+            seconds=len(rows)
+        )
+        rows.append(row)
+    dataframe = pd.concat(rows, ignore_index=True)
+
+    result = validate_air_quality(dataframe)
+
+    assert result.total_valid == len(boundary_values)
+    assert result.total_rejected == 0
+
+
+def test_quality_accepts_null_optional_fields(
+    normalized_dataframe: pd.DataFrame,
+) -> None:
+    dataframe = normalized_dataframe.copy(deep=True)
+    optional_columns = (
+        "latitude",
+        "longitude",
+        "main_pollutant",
+        "temperature_c",
+        "humidity_pct",
+        "pressure_hpa",
+        "wind_speed_ms",
+        "wind_direction_deg",
+    )
+    for column in optional_columns:
+        dataframe[column] = pd.NA
+
+    result = validate_air_quality(dataframe)
+
+    assert result.total_valid == 1
+    assert result.total_rejected == 0
+    assert all(
+        pd.isna(result.valid_records.loc[0, column])
+        for column in optional_columns
+    )
+
+
+@pytest.mark.parametrize(
+    ("column", "invalid_value"),
+    [
+        ("latitude", "norte"),
+        ("longitude", "oeste"),
+        ("temperature_c", "cálido"),
+        ("humidity_pct", "húmedo"),
+        ("pressure_hpa", "alta"),
+        ("wind_speed_ms", "rápido"),
+        ("wind_direction_deg", "sur"),
+        ("main_pollutant", 123),
+    ],
+)
+def test_quality_rejects_invalid_present_optional_fields(
+    column: str,
+    invalid_value: Any,
+    normalized_dataframe: pd.DataFrame,
+) -> None:
+    dataframe = dataframe_with_value(
+        normalized_dataframe,
+        column,
+        invalid_value,
+    )
+
+    result = validate_air_quality(dataframe)
+
+    assert result.total_rejected == 1
+    assert column in result.rejected_records.loc[0, "rejection_reason"]
+    assert result.rejected_records.loc[0, column] == invalid_value
+
+
+def test_quality_preserves_multiple_reasons_in_stable_order(
+    normalized_dataframe: pd.DataFrame,
+) -> None:
+    dataframe = normalized_dataframe.copy(deep=True).astype("object")
+    dataframe.loc[0, "city"] = ""
+    dataframe.loc[0, "aqius"] = -1
+    dataframe.loc[0, "humidity_pct"] = 101
+    dataframe.loc[0, "pressure_hpa"] = 0
+    dataframe.loc[0, "wind_speed_ms"] = -1
+    dataframe.loc[0, "wind_direction_deg"] = 360
+
+    result = validate_air_quality(dataframe)
+
+    assert result.rejected_records.loc[0, "rejection_reason"] == (
+        "city: debe contener texto; "
+        "aqius: debe ser mayor o igual que 0; "
+        "humidity_pct: debe ser <= 100; "
+        "pressure_hpa: debe ser > 0; "
+        "wind_speed_ms: debe ser >= 0; "
+        "wind_direction_deg: debe ser < 360"
+    )
+
+
+def test_quality_separates_batches_and_reports_counts(
+    normalized_dataframe: pd.DataFrame,
+) -> None:
+    valid = normalized_dataframe.copy(deep=True)
+    empty_city = dataframe_with_value(valid, "city", "")
+    invalid_humidity = dataframe_with_value(
+        valid,
+        "humidity_pct",
+        101,
+    )
+    dataframe = pd.concat(
+        (valid, empty_city, invalid_humidity),
+        ignore_index=True,
+    )
+
+    result = validate_air_quality(dataframe)
+
+    assert result.total_received == 3
+    assert result.total_valid == 1
+    assert result.total_rejected == 2
+    assert len(result.valid_records) == 1
+    assert len(result.rejected_records) == 2
+
+
+def test_quality_outputs_have_stable_columns_and_dtypes(
+    normalized_dataframe: pd.DataFrame,
+) -> None:
+    invalid = dataframe_with_value(
+        normalized_dataframe,
+        "temperature_c",
+        "desconocida",
+    )
+    dataframe = pd.concat(
+        (normalized_dataframe, invalid),
+        ignore_index=True,
+    )
+
+    result = validate_air_quality(dataframe)
+
+    assert tuple(result.valid_records.columns) == SCHEMA_COLUMNS
+    assert tuple(result.rejected_records.columns) == REJECTED_COLUMNS
+    assert {
+        column: str(result.valid_records[column].dtype)
+        for column in SCHEMA_COLUMNS
+    } == {
+        "record_id": "string",
+        "city": "string",
+        "state": "string",
+        "country": "string",
+        "latitude": "Float64",
+        "longitude": "Float64",
+        "timestamp_api": "datetime64[ns, UTC]",
+        "timestamp_extraction": "datetime64[ns, UTC]",
+        "aqius": "Int64",
+        "main_pollutant": "string",
+        "temperature_c": "Float64",
+        "humidity_pct": "Float64",
+        "pressure_hpa": "Float64",
+        "wind_speed_ms": "Float64",
+        "wind_direction_deg": "Float64",
+    }
+    assert str(result.rejected_records["record_id"].dtype) == "string"
+    assert all(
+        str(result.rejected_records[column].dtype) == "object"
+        for column in SCHEMA_COLUMNS
+        if column != "record_id"
+    )
+    assert (
+        str(result.rejected_records["rejection_reason"].dtype)
+        == "string"
+    )
+
+
+def test_quality_empty_input_preserves_output_schemas() -> None:
+    dataframe = pd.DataFrame(columns=SCHEMA_COLUMNS)
+
+    result = validate_air_quality(dataframe)
+
+    assert result.total_received == 0
+    assert tuple(result.valid_records.columns) == SCHEMA_COLUMNS
+    assert tuple(result.rejected_records.columns) == REJECTED_COLUMNS
+    assert str(result.valid_records["timestamp_api"].dtype) == (
+        "datetime64[ns, UTC]"
+    )
+    assert str(result.valid_records["timestamp_extraction"].dtype) == (
+        "datetime64[ns, UTC]"
+    )
+
+
+def test_quality_does_not_modify_source_dataframe(
+    normalized_dataframe: pd.DataFrame,
+) -> None:
+    dataframe = dataframe_with_value(
+        normalized_dataframe,
+        "humidity_pct",
+        101,
+    )
+    original = dataframe.copy(deep=True)
+
+    validate_air_quality(dataframe)
+
+    pd.testing.assert_frame_equal(dataframe, original)
+
+
+def test_quality_propagates_transform_warnings(
+    sample_payload: dict[str, Any],
+) -> None:
+    payload = deepcopy(sample_payload)
+    payload["data"]["current"]["weather"]["ts"] = (
+        "2026-07-24T19:00:00.000Z"
+    )
+    transformed = transform_air_quality(make_extraction_result(payload))
+
+    result = validate_air_quality(transformed)
+
+    assert result.warnings == transformed.warnings
+    assert result.warnings[0].code == "weather_timestamp_mismatch"
+
+
+def test_transform_preserves_invalid_values_until_rejection(
+    sample_payload: dict[str, Any],
+) -> None:
+    payload = deepcopy(sample_payload)
+    payload["data"]["current"]["weather"]["tp"] = "desconocida"
+    payload["data"]["current"]["pollution"]["aqius"] = "sin-dato"
+
+    transformed = transform_air_quality(make_extraction_result(payload))
+    result = validate_air_quality(transformed)
+
+    assert transformed.dataframe.loc[0, "temperature_c"] == "desconocida"
+    assert transformed.dataframe.loc[0, "aqius"] == "sin-dato"
+    assert result.total_rejected == 1
+    assert result.rejected_records.loc[0, "temperature_c"] == "desconocida"
+    assert result.rejected_records.loc[0, "aqius"] == "sin-dato"
+
+
+def test_quality_requires_confirmed_schema_columns(
+    normalized_dataframe: pd.DataFrame,
+) -> None:
+    dataframe = normalized_dataframe.drop(columns=["aqius"])
+
+    with pytest.raises(MissingQualityColumnsError, match="aqius"):
+        validate_air_quality(dataframe)

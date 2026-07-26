@@ -6,11 +6,12 @@ import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, overload
+from typing import Any, Literal, overload
 
 import pandas as pd
 
 from etl.extract import ExtractionResult
+from etl.utils import generate_record_id
 
 
 SCHEMA_COLUMNS: tuple[str, ...] = (
@@ -30,6 +31,10 @@ SCHEMA_COLUMNS: tuple[str, ...] = (
     "wind_speed_ms",
     "wind_direction_deg",
 )
+REJECTED_COLUMNS: tuple[str, ...] = (
+    *SCHEMA_COLUMNS,
+    "rejection_reason",
+)
 
 _OPTIONAL_WEATHER_FIELDS: dict[str, str] = {
     "temperature_c": "tp",
@@ -44,6 +49,39 @@ _EXCLUDED_SOURCE_FIELDS: tuple[str, ...] = (
     "ic",
     "heatIndex",
 )
+_STRING_COLUMNS: tuple[str, ...] = (
+    "record_id",
+    "city",
+    "state",
+    "country",
+    "main_pollutant",
+)
+_FLOAT_COLUMNS: tuple[str, ...] = (
+    "latitude",
+    "longitude",
+    "temperature_c",
+    "humidity_pct",
+    "pressure_hpa",
+    "wind_speed_ms",
+    "wind_direction_deg",
+)
+_TIMESTAMP_COLUMNS: tuple[str, ...] = (
+    "timestamp_api",
+    "timestamp_extraction",
+)
+_OPTIONAL_NUMERIC_RULES: tuple[
+    tuple[str, float | None, bool, float | None, bool],
+    ...,
+] = (
+    ("latitude", -90.0, True, 90.0, True),
+    ("longitude", -180.0, True, 180.0, True),
+    ("temperature_c", None, True, None, True),
+    ("humidity_pct", 0.0, True, 100.0, True),
+    ("pressure_hpa", 0.0, False, None, True),
+    ("wind_speed_ms", 0.0, True, None, True),
+    ("wind_direction_deg", 0.0, True, 360.0, False),
+)
+_QualityStatus = Literal["missing", "invalid", "valid"]
 
 
 class TransformationError(ValueError):
@@ -68,6 +106,21 @@ class InvalidTransformTimestampError(TransformationError):
         self.field_name = field_name
         super().__init__(
             f"El campo {field_name} debe ser un timestamp válido con zona horaria"
+        )
+
+
+class QualityValidationError(ValueError):
+    """Error base de la validación de calidad tabular."""
+
+
+class MissingQualityColumnsError(QualityValidationError):
+    """El DataFrame no contiene todas las columnas del esquema confirmado."""
+
+    def __init__(self, missing_columns: tuple[str, ...]) -> None:
+        self.missing_columns = missing_columns
+        columns = ", ".join(missing_columns)
+        super().__init__(
+            f"El DataFrame no contiene las columnas requeridas: {columns}"
         )
 
 
@@ -97,6 +150,18 @@ class TransformResult:
     warnings: tuple[TransformWarning, ...]
     records_transformed: int
     schema: TransformSchemaMetadata
+
+
+@dataclass(frozen=True, slots=True)
+class QualityResult:
+    """Resultado tipado de validar y clasificar registros normalizados."""
+
+    valid_records: pd.DataFrame = field(repr=False)
+    rejected_records: pd.DataFrame = field(repr=False)
+    warnings: tuple[TransformWarning, ...]
+    total_received: int
+    total_valid: int
+    total_rejected: int
 
 
 @overload
@@ -249,6 +314,239 @@ def transform_air_quality(
         records_transformed=len(dataframe),
         schema=schema,
     )
+
+
+def validate_air_quality(
+    source: TransformResult | pd.DataFrame,
+) -> QualityResult:
+    """Valida registros normalizados y los separa sin alterar la entrada."""
+
+    if isinstance(source, TransformResult):
+        dataframe = source.dataframe
+        warnings = source.warnings
+    elif isinstance(source, pd.DataFrame):
+        dataframe = source
+        warnings = ()
+    else:
+        raise QualityValidationError(
+            "La validación requiere TransformResult o un DataFrame"
+        )
+
+    missing_columns = tuple(
+        column
+        for column in SCHEMA_COLUMNS
+        if column not in dataframe.columns
+    )
+    if missing_columns:
+        raise MissingQualityColumnsError(missing_columns)
+
+    source_copy = dataframe.loc[:, SCHEMA_COLUMNS].copy(deep=True)
+    valid_rows: list[dict[str, Any]] = []
+    rejected_rows: list[dict[str, Any]] = []
+
+    for _, row in source_copy.iterrows():
+        normalized, rejection_reasons = _validate_normalized_record(row)
+        if rejection_reasons:
+            rejected = {
+                column: row[column]
+                for column in SCHEMA_COLUMNS
+            }
+            rejected["record_id"] = pd.NA
+            rejected["rejection_reason"] = "; ".join(rejection_reasons)
+            rejected_rows.append(rejected)
+            continue
+
+        normalized["record_id"] = generate_record_id(
+            normalized["city"],
+            normalized["state"],
+            normalized["country"],
+            normalized["timestamp_api"].to_pydatetime(),
+        )
+        valid_rows.append(normalized)
+
+    valid_records = _build_valid_records(valid_rows)
+    rejected_records = _build_rejected_records(rejected_rows)
+    return QualityResult(
+        valid_records=valid_records,
+        rejected_records=rejected_records,
+        warnings=warnings,
+        total_received=len(source_copy),
+        total_valid=len(valid_records),
+        total_rejected=len(rejected_records),
+    )
+
+
+def _validate_normalized_record(
+    row: pd.Series,
+) -> tuple[dict[str, Any], list[str]]:
+    """Valida una fila y devuelve valores normalizados y motivos estables."""
+
+    normalized = {
+        column: row[column]
+        for column in SCHEMA_COLUMNS
+    }
+    normalized["record_id"] = pd.NA
+    reasons: list[str] = []
+
+    for column in ("city", "state", "country"):
+        value = row[column]
+        if not isinstance(value, str) or not value.strip():
+            reasons.append(f"{column}: debe contener texto")
+        else:
+            normalized[column] = value
+
+    for column in _TIMESTAMP_COLUMNS:
+        timestamp = _quality_timestamp(row[column])
+        if timestamp is None:
+            reasons.append(
+                f"{column}: debe ser una fecha válida con zona horaria"
+            )
+        else:
+            normalized[column] = timestamp
+
+    aqius, aqius_status = _quality_integer(row["aqius"])
+    if aqius_status != "valid":
+        reasons.append("aqius: debe existir y ser un entero válido")
+    else:
+        normalized["aqius"] = aqius
+        if aqius < 0:
+            reasons.append("aqius: debe ser mayor o igual que 0")
+
+    for (
+        column,
+        minimum,
+        minimum_inclusive,
+        maximum,
+        maximum_inclusive,
+    ) in _OPTIONAL_NUMERIC_RULES:
+        numeric, status = _quality_number(row[column])
+        if status == "missing":
+            normalized[column] = pd.NA
+            continue
+        if status == "invalid":
+            reasons.append(
+                f"{column}: debe ser numérico cuando está presente"
+            )
+            continue
+
+        normalized[column] = numeric
+        if minimum is not None:
+            below_minimum = (
+                numeric < minimum
+                if minimum_inclusive
+                else numeric <= minimum
+            )
+            if below_minimum:
+                operator = ">=" if minimum_inclusive else ">"
+                reasons.append(
+                    f"{column}: debe ser {operator} {minimum:g}"
+                )
+                continue
+        if maximum is not None:
+            above_maximum = (
+                numeric > maximum
+                if maximum_inclusive
+                else numeric >= maximum
+            )
+            if above_maximum:
+                operator = "<=" if maximum_inclusive else "<"
+                reasons.append(
+                    f"{column}: debe ser {operator} {maximum:g}"
+                )
+
+    main_pollutant = row["main_pollutant"]
+    if _is_null_scalar(main_pollutant):
+        normalized["main_pollutant"] = pd.NA
+    elif not isinstance(main_pollutant, str) or not main_pollutant.strip():
+        reasons.append(
+            "main_pollutant: debe contener texto cuando está presente"
+        )
+    else:
+        normalized["main_pollutant"] = main_pollutant
+
+    return normalized, reasons
+
+
+def _quality_timestamp(value: Any) -> pd.Timestamp | None:
+    """Normaliza un timestamp válido y consciente a UTC."""
+
+    if _is_null_scalar(value):
+        return None
+    try:
+        timestamp = pd.Timestamp(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if (
+        pd.isna(timestamp)
+        or timestamp.tzinfo is None
+        or timestamp.utcoffset() is None
+    ):
+        return None
+    return timestamp.tz_convert("UTC")
+
+
+def _quality_integer(value: Any) -> tuple[int, _QualityStatus]:
+    """Convierte un entero requerido e informa si es válido."""
+
+    if _is_null_scalar(value) or isinstance(value, bool):
+        return 0, "missing"
+    numeric, status = _quality_number(value)
+    if status != "valid" or not numeric.is_integer():
+        return 0, "invalid"
+    return int(numeric), "valid"
+
+
+def _quality_number(value: Any) -> tuple[float, _QualityStatus]:
+    """Convierte un escalar numérico finito conservando el estado de nulo."""
+
+    if _is_null_scalar(value):
+        return 0.0, "missing"
+    if isinstance(value, bool):
+        return 0.0, "invalid"
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0, "invalid"
+    if not math.isfinite(numeric):
+        return 0.0, "invalid"
+    return numeric, "valid"
+
+
+def _build_valid_records(rows: list[dict[str, Any]]) -> pd.DataFrame:
+    """Construye registros aceptados con el esquema tipado confirmado."""
+
+    dataframe = pd.DataFrame(rows, columns=SCHEMA_COLUMNS)
+    for column in _STRING_COLUMNS:
+        dataframe[column] = dataframe[column].astype("string")
+    for column in _FLOAT_COLUMNS:
+        dataframe[column] = pd.to_numeric(
+            dataframe[column],
+            errors="coerce",
+        ).astype("Float64")
+    for column in _TIMESTAMP_COLUMNS:
+        dataframe[column] = pd.to_datetime(
+            dataframe[column],
+            errors="coerce",
+            utc=True,
+        ).astype("datetime64[ns, UTC]")
+    dataframe["aqius"] = pd.to_numeric(
+        dataframe["aqius"],
+        errors="coerce",
+    ).astype("Int64")
+    return dataframe
+
+
+def _build_rejected_records(rows: list[dict[str, Any]]) -> pd.DataFrame:
+    """Conserva valores rechazados con dtypes aptos para datos inválidos."""
+
+    dataframe = pd.DataFrame(rows, columns=REJECTED_COLUMNS)
+    for column in SCHEMA_COLUMNS:
+        dataframe[column] = dataframe[column].astype("object")
+    dataframe["record_id"] = dataframe["record_id"].astype("string")
+    dataframe["rejection_reason"] = dataframe[
+        "rejection_reason"
+    ].astype("string")
+    return dataframe
 
 
 def _resolve_source(
@@ -417,20 +715,43 @@ def _build_dataframe(
 
 
 def _nullable_float_series(value: Any) -> pd.Series:
-    """Convierte un valor a ``Float64`` conservando nulos."""
+    """Convierte a ``Float64`` sin ocultar valores de origen inválidos."""
 
+    if _is_null_scalar(value):
+        return pd.Series([pd.NA], dtype="Float64")
     numeric = pd.to_numeric(pd.Series([value]), errors="coerce")
+    if pd.isna(numeric.iloc[0]):
+        return pd.Series([value], dtype="object")
     return numeric.astype("Float64")
 
 
 def _nullable_integer_series(value: Any) -> pd.Series:
-    """Convierte un valor entero a ``Int64`` y deja inválidos como nulos."""
+    """Convierte a ``Int64`` sin confundir inválidos con valores ausentes."""
 
+    if _is_null_scalar(value):
+        return pd.Series([pd.NA], dtype="Int64")
     numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
     if pd.isna(numeric) or not math.isfinite(float(numeric)):
-        normalized = pd.NA
+        return pd.Series([value], dtype="object")
     elif float(numeric).is_integer():
         normalized = int(numeric)
     else:
-        normalized = pd.NA
+        return pd.Series([value], dtype="object")
     return pd.Series([normalized], dtype="Int64")
+
+
+def _is_null_scalar(value: Any) -> bool:
+    """Identifica nulos escalares sin evaluar colecciones como booleanos."""
+
+    if value is None:
+        return True
+    try:
+        missing = pd.isna(value)
+    except (TypeError, ValueError):
+        return False
+    if hasattr(missing, "__len__"):
+        return False
+    try:
+        return bool(missing)
+    except TypeError:
+        return False

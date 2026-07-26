@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 import time
+import unicodedata
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Iterable, TextIO
@@ -39,6 +41,40 @@ def format_utc_timestamp(
 
     normalized = timestamp.astimezone(UTC)
     return normalized.isoformat(timespec=timespec).replace("+00:00", "Z")
+
+
+def generate_record_id(
+    city: str,
+    state: str,
+    country: str,
+    timestamp_api: datetime,
+) -> str:
+    """Genera un SHA-256 estable para una ubicación y un instante en UTC."""
+
+    location = (
+        _canonicalize_identifier_text(city, field_name="city"),
+        _canonicalize_identifier_text(state, field_name="state"),
+        _canonicalize_identifier_text(country, field_name="country"),
+    )
+    timestamp = format_utc_timestamp(
+        timestamp_api,
+        timespec="microseconds",
+    )
+    canonical_value = "|".join((*location, timestamp))
+    return hashlib.sha256(canonical_value.encode("utf-8")).hexdigest()
+
+
+def _canonicalize_identifier_text(value: str, *, field_name: str) -> str:
+    """Normaliza Unicode, espacios y mayúsculas para un identificador."""
+
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} debe contener texto")
+
+    normalized = unicodedata.normalize("NFKC", value)
+    normalized = " ".join(normalized.split()).casefold()
+    if not normalized:
+        raise ValueError(f"{field_name} debe contener texto")
+    return normalized
 
 
 def ensure_data_directories(paths: ProjectPaths) -> tuple[Path, ...]:
