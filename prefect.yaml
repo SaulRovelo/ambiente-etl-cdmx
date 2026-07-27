@@ -1,0 +1,27 @@
+name: ambiente-etl-cdmx
+prefect-version: 3.7.8
+
+build: null
+push: null
+
+pull:
+  - prefect.deployments.steps.set_working_directory:
+      directory: .
+
+deployments:
+  - name: calidad-aire-cdmx-horario
+    description: Ejecución local horaria del pipeline de calidad del aire.
+    entrypoint: etl/flow.py:air_quality_flow
+    parameters: {}
+    schedule:
+      cron: "10 * * * *"
+      timezone: America/Mexico_City
+      active: true
+    concurrency_limit:
+      limit: 1
+      collision_strategy: CANCEL_NEW
+    work_pool:
+      name: ambiente-etl-local
+      work_queue_name: default
+      job_variables:
+        working_dir: .
